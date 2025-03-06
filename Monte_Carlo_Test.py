@@ -16,7 +16,7 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("Monte Carlo Simulation for Pressure Drop (Using CoolProp)")
+st.title("Monte Carlo Simulation for Pressure Drop")
 
 # --------------------------------------------------------------------------------
 # INSTRUCTIONS AND LA TE X EQUATIONS
