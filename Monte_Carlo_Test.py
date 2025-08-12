@@ -4,7 +4,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.stats import triang
 import io
-import matplotlib as mpl
+from datetime import datetime
+import time
 
 # Import CoolProp
 from CoolProp.CoolProp import PropsSI
@@ -69,6 +70,18 @@ COMMON_K_VALUES = {
 }
 # Regenerate component options based on the updated dictionary, sorted alphabetically
 component_options = sorted(list(COMMON_K_VALUES.keys())) + ["Custom"]
+
+# Typical absolute roughness presets (meters)
+ROUGHNESS_PRESETS = {
+    "Commercial Steel": 4.5e-5,
+    "Stainless Steel (Smooth)": 1.0e-5,
+    "Drawn Copper / Brass": 1.5e-5,
+    "PVC / Smooth Plastic": 1.5e-5,
+    "Galvanized Iron": 1.5e-4,
+    "Cast Iron": 2.6e-4,
+    "Concrete (New)": 3.0e-4,
+    "Concrete (Old)": 9.0e-4
+}
 
 # Define fluid options globally for use throughout the application
 # Common fluid options for CoolProp with display names
@@ -143,6 +156,14 @@ if 'minor_loss_multiselect' not in st.session_state:
     st.session_state.minor_loss_multiselect = []
 if 'minor_losses_state' not in st.session_state:
     st.session_state.minor_losses_state = {}
+if 'roughness_preset' not in st.session_state:
+    st.session_state.roughness_preset = 'Custom'
+if 'simulation_cache' not in st.session_state:
+    st.session_state.simulation_cache = {}
+if 'simulation_metadata' not in st.session_state:
+    st.session_state.simulation_metadata = {}
+if 'custom_k_counter' not in st.session_state:
+    st.session_state.custom_k_counter = 1
 
 # Custom CSS for better engineering visuals
 st.markdown("""
@@ -178,48 +199,37 @@ using the <b>Darcy-Weisbach</b> equation and <b>CoolProp</b> for accurate fluid 
 # --------------------------------------------------------------------------------
 def get_distribution(dist_name, mean, std_dev, min_val=None, max_val=None):
     """Return a function that generates random samples from the specified distribution.
-    Handles invalid parameters by defaulting to deterministic mean.
+    Notes:
+      - For Triangular, the 'mean' argument is treated as MODE (UI label = Mode).
+    Handles invalid parameters by defaulting to deterministic value.
     """
     if dist_name == 'Normal':
-        # Ensure std_dev is significantly greater than zero
         if std_dev is not None and std_dev > 1e-15:
-             return lambda size: np.random.normal(mean, std_dev, size)
-        else:
-             # If std_dev is effectively zero or None, return the mean
-             st.warning(f"Std Dev for Normal distribution is zero or invalid. Using deterministic mean ({mean}).")
-             return lambda size: np.full(size, mean)
-    elif dist_name == 'Uniform':
-        # Ensure min_val and max_val are valid and different
+            return lambda size: np.random.normal(mean, std_dev, size)
+        st.warning(f"Std Dev for Normal distribution is zero or invalid. Using deterministic mean ({mean}).")
+        return lambda size: np.full(size, mean)
+    if dist_name == 'Uniform':
         if min_val is not None and max_val is not None and max_val > min_val:
             return lambda size: np.random.uniform(min_val, max_val, size)
-        else:
-            # If range is invalid, return the mean
-            st.warning(f"Min/Max for Uniform distribution are invalid ({min_val}, {max_val}). Using deterministic mean ({mean}).")
-            return lambda size: np.full(size, mean)
-    elif dist_name == 'Triangular':
-        # Ensure min_val and max_val are valid and different
-        if min_val is not None and max_val is not None and max_val > min_val:
-            # Ensure mean is within [min_val, max_val]
-            if min_val <= mean <= max_val:
-                # Avoid division by zero if max_val == min_val (already caught above, but belt-and-suspenders)
-                scale = max_val - min_val
-                c = (mean - min_val) / scale if scale > 1e-15 else 0.5 # mode defaults to midpoint if range is zero
-                return lambda size: triang.rvs(c, loc=min_val, scale=scale, size=size)
-            else:
-                # If mean is outside range, default to mean
-                st.warning(f"Mean ({mean}) for Triangular distribution is outside range [{min_val}, {max_val}]. Using deterministic mean.")
-                return lambda size: np.full(size, mean)
-        else:
-            # If range is invalid, return the mean
-            st.warning(f"Min/Max for Triangular distribution are invalid ({min_val}, {max_val}). Using deterministic mean ({mean}).")
-            return lambda size: np.full(size, mean)
-    else: # Deterministic or unrecognized
-        if dist_name != 'Deterministic':
-             st.warning(f"Unrecognized distribution '{dist_name}'. Using deterministic mean ({mean}).")
+        st.warning(f"Min/Max for Uniform distribution are invalid ({min_val}, {max_val}). Using deterministic mean ({mean}).")
         return lambda size: np.full(size, mean)
+    if dist_name == 'Triangular':
+        mode = mean
+        if min_val is not None and max_val is not None and max_val > min_val:
+            if min_val <= mode <= max_val:
+                scale = max_val - min_val
+                c = (mode - min_val) / scale if scale > 1e-15 else 0.5
+                return lambda size: triang.rvs(c, loc=min_val, scale=scale, size=size)
+            st.warning(f"Mode ({mode}) for Triangular distribution is outside range [{min_val}, {max_val}]. Using deterministic value.")
+            return lambda size: np.full(size, mode)
+        st.warning(f"Min/Max for Triangular distribution are invalid ({min_val}, {max_val}). Using deterministic value ({mode}).")
+        return lambda size: np.full(size, mode)
+    if dist_name != 'Deterministic':
+        st.warning(f"Unrecognized distribution '{dist_name}'. Using deterministic mean ({mean}).")
+    return lambda size: np.full(size, mean)
 
-def pa_to_psia(pa_values):
-    """Convert Pascal to psia"""
+def pa_to_psi(pa_values):
+    """Convert Pascal to psi"""
     return pa_values * 0.000145038
 
 def create_distribution_inputs(label, default_value_for_mean, unit, key_prefix, default_dist="Deterministic",
@@ -269,8 +279,10 @@ def create_distribution_inputs(label, default_value_for_mean, unit, key_prefix, 
 
         # 3. Create the number input widget using the determined value FROM SESSION STATE.
         #    Remove the 'value=' argument to avoid the warning.
+        # Dynamic label: Mode for Triangular, Mean otherwise
+        dynamic_label = "Mode" if dist == 'Triangular' else "Mean"
         mean = st.number_input(
-            f"Mean ({unit})",
+            f"{dynamic_label} ({unit})",
             # value=mean_value_to_use, # REMOVED: Value is taken from session state via key
             format="%.4g",
             key=mean_key, # Key remains the same
@@ -348,17 +360,25 @@ def render_fluid_section():
         p_col, t_col = st.columns(2)
         
         with p_col:
-            # Ensure session state exists before creating widget
+            # Unified pressure input supporting kPa and psia with internal storage in kPa
+            if 'pressure_unit' not in st.session_state:
+                st.session_state.pressure_unit = 'kPa'
             if 'pressure_kPa' not in st.session_state:
-                st.session_state.pressure_kPa = 101.325 # Default value
-            pressure_kPa = st.number_input(
-                "Pressure (kPa)", 
-                # value=st.session_state.get('pressure_kPa', 101.325), # REMOVED
-                min_value=10.0,
-                step=10.0,
-                format="%.3g",
-                key="pressure_kPa"
+                st.session_state.pressure_kPa = 101.325  # 1 atm
+            pressure_unit = st.selectbox("Pressure Unit", ['kPa', 'psia'], key='pressure_unit')
+            # Derive display value
+            display_pressure = st.session_state.pressure_kPa if pressure_unit == 'kPa' else st.session_state.pressure_kPa / 6.894757
+            pressure_input = st.number_input(
+                f"Pressure ({pressure_unit})",
+                min_value=0.1,
+                step=1.0,
+                format="%.4g",
+                value=display_pressure,
+                key='pressure_input'
             )
+            # Convert back to kPa for internal use
+            st.session_state.pressure_kPa = pressure_input if pressure_unit == 'kPa' else pressure_input * 6.894757
+            pressure_kPa = st.session_state.pressure_kPa
             
         with t_col:
             # Ensure session state exists before creating widget
@@ -457,8 +477,29 @@ def render_minor_losses_section():
         selected_comps = st.multiselect(
             "Select Components:",
             options=component_options,
-            key="minor_loss_multiselect"
+            key="minor_loss_multiselect",
+            help="Select standard components or choose 'Custom' to add a user-defined K value."
         )
+
+        # Custom component creation UI
+        if 'Custom' in selected_comps:
+            st.markdown("**Custom Component Entry**")
+            cc1, cc2, cc3 = st.columns([2,1,1])
+            with cc1:
+                custom_name = st.text_input("Name", key="custom_k_name", placeholder="e.g., Special Insert")
+            with cc2:
+                custom_qty = st.number_input("Qty", min_value=1, step=1, key="custom_k_qty")
+            with cc3:
+                custom_k = st.number_input("K", min_value=0.0, format="%.5g", key="custom_k_val")
+            add_custom = st.button("➕ Add Custom Component")
+            if add_custom:
+                base = custom_name.strip() or 'Custom Component'
+                unique = f"{base} #{st.session_state.custom_k_counter}"
+                st.session_state.custom_k_counter += 1
+                st.session_state.minor_losses_state[unique] = {"quantity": custom_qty, "k_value": custom_k}
+                st.session_state[f"qty_{unique}"] = custom_qty
+                st.session_state[f"k_{unique}"] = custom_k
+                st.success(f"Added {unique}")
         
         # Remove the line that tries to modify session state after widget creation
         # st.session_state.minor_loss_multiselect = selected_comps
@@ -541,7 +582,8 @@ def save_inputs_to_session_state(
         mass_flow_dist, mass_flow_mean, mass_flow_std, mass_flow_min, mass_flow_max,
         elevation_dist, elevation_mean, elevation_std, elevation_min, elevation_max,
         num_simulations, confidence_level, minor_losses_data, gravity, selected_fluid,
-        temperature_K, pressure_kPa, minor_loss_multiselect, selected_fluid_idx # <- Added selected_fluid_idx
+        temperature_K, pressure_kPa, pressure_unit, minor_loss_multiselect, selected_fluid_idx,
+        units_selected, friction_model, roughness_preset
     ):
     """Store all simulation inputs in the session state for persistence between tabs"""
     st.session_state.simulation_inputs = {
@@ -549,7 +591,8 @@ def save_inputs_to_session_state(
         'selected_fluid': selected_fluid,
         'selected_fluid_idx': selected_fluid_idx, # <- Added
         'temperature_K': temperature_K,
-        'pressure_kPa': pressure_kPa,
+    'pressure_kPa': pressure_kPa,
+    'pressure_unit': pressure_unit,
         'rho_dist': rho_dist,
         'rho_mean': rho_mean,
         'rho_std': rho_std,
@@ -592,7 +635,10 @@ def save_inputs_to_session_state(
         'confidence_level': confidence_level,
         'minor_losses_data': minor_losses_data, # Store the minor losses data
         'minor_loss_multiselect': minor_loss_multiselect, # <- Added selected components list
-        'gravity': gravity,
+    'gravity': gravity,
+    'units_selected': units_selected,
+    'friction_model': friction_model,
+    'roughness_preset': roughness_preset,
     }
     st.session_state.simulation_run = True
 
@@ -626,33 +672,27 @@ if st.session_state.active_tab == "setup":
         
         # Simulation parameters
         st.header("Simulation Parameters")
-        
         sim_col1, sim_col2 = st.columns(2)
         with sim_col1:
-            # Ensure session state exists before creating widget
             if 'num_simulations' not in st.session_state:
-                st.session_state.num_simulations = 5000 # Default value
+                st.session_state.num_simulations = 5000
             num_simulations = st.number_input(
-                "Number of Simulations", 
-                min_value=1000, 
-                max_value=100000, 
-                # value=st.session_state.get('num_simulations', 5000), # REMOVED
-                step=1000,
+                "Number of Simulations",
+                min_value=100,
+                max_value=200000,
+                step=100,
                 format="%d",
-                key="num_simulations"
+                key='num_simulations'
             )
-            
         with sim_col2:
-            # Ensure session state exists before creating widget
             if 'confidence_level' not in st.session_state:
-                st.session_state.confidence_level = 95 # Default value
+                st.session_state.confidence_level = 95
             confidence_level = st.slider(
-                "Confidence Interval (%)", 
-                min_value=90, 
-                max_value=99, 
-                # value=st.session_state.get('confidence_level', 95), # REMOVED
+                "Confidence Interval (%)",
+                min_value=90,
+                max_value=99,
                 step=1,
-                key="confidence_level"
+                key='confidence_level'
             )
             
         # Output units selection with visual indicators - Fix unit selection persistence
@@ -705,7 +745,7 @@ if st.session_state.active_tab == "setup":
             # Pipe length with distribution
             L_dist, L_mean, L_std, L_min, L_max = create_distribution_inputs(
                 length_label("Pipe Length"), 
-                18.0 if st.session_state.units_selected=="Inches" else 6.0, 
+                18.0 if st.session_state.units_selected=="Inches" else 0.4572, 
                 st.session_state.units_selected.lower(), 
                 "L",
                 default_dist=st.session_state.get('L_dist', 'Deterministic'),
@@ -715,7 +755,32 @@ if st.session_state.active_tab == "setup":
                 tooltip="Total straight pipe length"
             )
             
-            # Pipe roughness with distribution (always in meters)
+            # Roughness presets selector
+            preset_options = ['Custom'] + [f"{k} (ε={v:.2g} m)" for k,v in ROUGHNESS_PRESETS.items()]
+            display_to_key = {f"{k} (ε={v:.2g} m)": k for k,v in ROUGHNESS_PRESETS.items()}
+            selected_display = st.selectbox(
+                "Roughness Material Preset",
+                preset_options,
+                key='roughness_preset',
+                help="Select a material to auto-fill roughness (absolute ε). Choose 'Custom' to input manually."
+            )
+            selected_preset = display_to_key.get(selected_display, 'Custom')
+            if selected_preset != 'Custom':
+                st.session_state.epsilon_dist = 'Deterministic'
+                st.session_state.epsilon_mean = ROUGHNESS_PRESETS[selected_preset]
+                var_col, pct_col = st.columns([1,1])
+                with var_col:
+                    apply_var = st.checkbox("±% Var", key="epsilon_var_toggle", help="Apply symmetric percentage variability as Uniform bounds")
+                with pct_col:
+                    pct_var = st.number_input("Percent", min_value=1, max_value=50, value=10, step=1, key="epsilon_var_pct") if apply_var else 0
+                if apply_var:
+                    mean_val = ROUGHNESS_PRESETS[selected_preset]
+                    span = mean_val * (pct_var/100)
+                    st.session_state.epsilon_dist = 'Uniform'
+                    st.session_state.epsilon_min = mean_val - span
+                    st.session_state.epsilon_max = mean_val + span
+
+            # Pipe roughness with distribution (always in meters); default value uses session state epsilon_mean if set
             epsilon_dist, epsilon_mean, epsilon_std, epsilon_min, epsilon_max = create_distribution_inputs(
                 "Roughness", 0.000015, "m", "epsilon",
                 default_dist=st.session_state.get('epsilon_dist', 'Deterministic'),
@@ -763,11 +828,39 @@ if st.session_state.active_tab == "setup":
                 help="Default value is for Earth (9.81 m/s²)",
                 key="gravity"
             )
+            # Friction factor model selection
+            if 'friction_model' not in st.session_state:
+                st.session_state.friction_model = "Standard (Laminar + Swamee-Jain)"
+            friction_model = st.selectbox(
+                "Friction Factor Model",
+                ["Standard (Laminar + Swamee-Jain)", "Churchill (All Regimes)", "Blended (Transitional)"],
+                key="friction_model",
+                help="Blended: linear blend 2000<Re<4000 between laminar and turbulent; Churchill: universal equation."
+            )
             
         # Large, prominent "Run Simulation" button
         st.markdown("<br>", unsafe_allow_html=True)
 
         # Define the function to run the simulation and save inputs
+        def validate_inputs():
+            errs = []
+            # Min/max checks for Uniform / Triangular
+            for prefix, label in [("D","Diameter"),("L","Length"),("epsilon","Roughness"),("mass_flow","Mass Flow"),("elevation","Elevation"),("rho","Density"),("mu","Viscosity")]:
+                dist = st.session_state.get(f"{prefix}_dist")
+                if dist in ['Uniform','Triangular']:
+                    mn = st.session_state.get(f"{prefix}_min")
+                    mx = st.session_state.get(f"{prefix}_max")
+                    if (mn is None) or (mx is None) or not (mx > mn):
+                        errs.append(f"{label}: Min must be < Max for {dist} distribution.")
+                if dist == 'Normal':
+                    std = st.session_state.get(f"{prefix}_std")
+                    if std is None or std <= 0:
+                        errs.append(f"{label}: Std Dev must be > 0 for Normal distribution.")
+            if st.session_state.get('D_mean',0) <= 0: errs.append("Diameter mean must be > 0.")
+            if st.session_state.get('L_mean',0) <= 0: errs.append("Length mean must be > 0.")
+            if st.session_state.get('mass_flow_mean',0) <= 0: errs.append("Mass flow mean must be > 0.")
+            return errs
+
         def run_and_save():
             # Gather all input values from the widgets
             # Note: We retrieve the values directly from the widgets/session state keys
@@ -830,653 +923,235 @@ if st.session_state.active_tab == "setup":
                 mass_flow_dist_val, mass_flow_mean_val, mass_flow_std_val, mass_flow_min_val, mass_flow_max_val,
                 elevation_dist_val, elevation_mean_val, elevation_std_val, elevation_min_val, elevation_max_val,
                 num_simulations_val, confidence_level_val, minor_losses_data_val, gravity_val, selected_fluid_val,
-                temperature_K_val, pressure_kPa_val, minor_loss_multiselect_val, selected_fluid_idx_val # <- Pass index
+                temperature_K_val, pressure_kPa_val, st.session_state.pressure_unit, minor_loss_multiselect_val, selected_fluid_idx_val,
+                st.session_state.units_selected, st.session_state.friction_model, st.session_state.roughness_preset
             )
-            # NEW: refresh individual widget keys
-            st.session_state.update(st.session_state.simulation_inputs)
+            # Removed bulk st.session_state.update to avoid StreamlitAPIException when setting widget keys (e.g., selected_fluid_idx) post-instantiation.
             # Switch to the results tab after saving
             switch_to_results()
 
-        run_simulation = st.button(
-            "▶ Run Monte Carlo Simulation",
-            key="run_simulation",
-            on_click=run_and_save, # This now correctly calls the function defined above
-            use_container_width=True
-        )
+        # Reproducibility controls
+        st.subheader("Reproducibility")
+        seed_col1, seed_col2 = st.columns([2,1])
+        with seed_col1:
+            rng_seed = st.text_input("Random Seed (optional integer)", key="rng_seed")
+        with seed_col2:
+            if rng_seed and not rng_seed.isdigit():
+                st.warning("Seed must be an integer.")
 
-        # Add a notification after running simulation to navigate to Results tab
-        if run_simulation:
-            # Store simulation flag in session state
-            st.session_state.simulation_run = True
-            
-            # Display a success message
-            st.success("""
-            ✅ **Simulation Completed Successfully!**
-            
-            Your results are now available in the Results tab. 
-            Click below to view pressure drop analysis and statistics.
-            """)
-            
-            # Use direct tab switching
-            if st.button("📊 View Results Now", 
-                         on_click=switch_to_results, 
-                         use_container_width=True):
-                pass  # This doesn't need any code as the on_click handler does the work
+        errors = validate_inputs()
+        if errors:
+            st.error("Resolve before running:\n- " + "\n- ".join(errors))
+        run_clicked = st.button("▶ Run Monte Carlo Simulation", key="run_sim_btn", use_container_width=True, disabled=bool(errors))
+        if run_clicked and not errors:
+            if rng_seed and rng_seed.isdigit():
+                np.random.seed(int(rng_seed))
+            run_and_save()
+            st.session_state.simulation_metadata = {
+                'seed': rng_seed if (rng_seed and rng_seed.isdigit()) else None,
+                'timestamp': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+                'version': 'v2.7'
+            }
+            st.success("Simulation configured. View Results tab.")
 
 # Results Tab Content
 elif st.session_state.active_tab == "results":
     if st.session_state.simulation_run:
-        # Get all inputs from session state
         inputs = st.session_state.simulation_inputs
-        
-        # Unpack inputs for easier reference
-        rho_dist = inputs['rho_dist']
-        rho_mean = inputs['rho_mean']
-        rho_std = inputs['rho_std']
-        rho_min = inputs['rho_min']
-        rho_max = inputs['rho_max']
-        mu_dist = inputs['mu_dist']
-        mu_mean = inputs['mu_mean']
-        mu_std = inputs['mu_std']
-        mu_min = inputs['mu_min']
-        mu_max = inputs['mu_max']
-        D_dist = inputs['D_dist']
-        D_mean = inputs['D_mean']
-        D_std = inputs['D_std']
-        D_min = inputs['D_min']
-        D_max = inputs['D_max']
-        L_dist = inputs['L_dist']
-        L_mean = inputs['L_mean']
-        L_std = inputs['L_std']
-        L_min = inputs['L_min']
-        L_max = inputs['L_max']
-        epsilon_dist = inputs['epsilon_dist']
-        epsilon_mean = inputs['epsilon_mean']
-        epsilon_std = inputs['epsilon_std']
-        epsilon_min = inputs['epsilon_min']
-        epsilon_max = inputs['epsilon_max']
-        mass_flow_dist = inputs['mass_flow_dist']
-        mass_flow_mean = inputs['mass_flow_mean']
-        mass_flow_std = inputs['mass_flow_std']
-        mass_flow_min = inputs['mass_flow_min']
-        mass_flow_max = inputs['mass_flow_max']
-        elevation_dist = inputs['elevation_dist']
-        elevation_mean = inputs['elevation_mean']
-        elevation_std = inputs['elevation_std']
-        elevation_min = inputs['elevation_min']
-        elevation_max = inputs['elevation_max']  # Fixed reference
-        num_simulations = inputs['num_simulations']
-        confidence_level = inputs['confidence_level']
-        # Get minor losses data (should be list of dicts here)
-        minor_losses_data = inputs['minor_losses_data'] 
-        gravity = inputs['gravity']
+        # Unpack
+        rho_dist = inputs['rho_dist']; rho_mean = inputs['rho_mean']; rho_std = inputs['rho_std']; rho_min = inputs['rho_min']; rho_max = inputs['rho_max']
+        mu_dist = inputs['mu_dist']; mu_mean = inputs['mu_mean']; mu_std = inputs['mu_std']; mu_min = inputs['mu_min']; mu_max = inputs['mu_max']
+        D_dist = inputs['D_dist']; D_mean = inputs['D_mean']; D_std = inputs['D_std']; D_min = inputs['D_min']; D_max = inputs['D_max']
+        L_dist = inputs['L_dist']; L_mean = inputs['L_mean']; L_std = inputs['L_std']; L_min = inputs['L_min']; L_max = inputs['L_max']
+        epsilon_dist = inputs['epsilon_dist']; epsilon_mean = inputs['epsilon_mean']; epsilon_std = inputs['epsilon_std']; epsilon_min = inputs['epsilon_min']; epsilon_max = inputs['epsilon_max']
+        mass_flow_dist = inputs['mass_flow_dist']; mass_flow_mean = inputs['mass_flow_mean']; mass_flow_std = inputs['mass_flow_std']; mass_flow_min = inputs['mass_flow_min']; mass_flow_max = inputs['mass_flow_max']
+        elevation_dist = inputs['elevation_dist']; elevation_mean = inputs['elevation_mean']; elevation_std = inputs['elevation_std']; elevation_min = inputs['elevation_min']; elevation_max = inputs['elevation_max']
+        num_simulations = inputs['num_simulations']; confidence_level = inputs['confidence_level']
+        minor_losses_data = inputs['minor_losses_data']; gravity = inputs['gravity']
+        units_selected_run = inputs.get('units_selected', st.session_state.units_selected)
+        friction_model = inputs.get('friction_model', "Standard (Laminar + Swamee-Jain)")
         selected_fluid = inputs['selected_fluid']
-        
+
         st.header("Simulation Progress")
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # Step 1: Generate Random Samples
-        status_text.text("Generating random samples...")
-        progress_bar.progress(10)
-        
-        # Build sampler functions
+        progress_bar = st.progress(0); status_text = st.empty()
+        status_text.text("Generating random samples..."); progress_bar.progress(10)
         rho_sampler = get_distribution(rho_dist, rho_mean, rho_std, rho_min, rho_max)
-        mu_sampler  = get_distribution(mu_dist, mu_mean, mu_std, mu_min, mu_max)
-        D_sampler   = get_distribution(D_dist, D_mean, D_std, D_min, D_max)
-        L_sampler   = get_distribution(L_dist, L_mean, L_std, L_min, L_max)
-        e_sampler   = get_distribution(epsilon_dist, epsilon_mean, epsilon_std, epsilon_min, epsilon_max)
-        mf_sampler  = get_distribution(mass_flow_dist, mass_flow_mean, mass_flow_std, mass_flow_min, mass_flow_max)
-        elev_sampler= get_distribution(elevation_dist, elevation_mean, elevation_std, elevation_min, elevation_max)
-    
-        # Generate numeric samples
-        rho_samples = rho_sampler(num_simulations)
-        mu_samples_mPa = mu_sampler(num_simulations)   # in mPa·s
-        D_input_samples = D_sampler(num_simulations)
-        L_input_samples = L_sampler(num_simulations)
-        epsilon_samples = e_sampler(num_simulations)
-        mass_flow_samples = mf_sampler(num_simulations)
+        mu_sampler = get_distribution(mu_dist, mu_mean, mu_std, mu_min, mu_max)
+        D_sampler = get_distribution(D_dist, D_mean, D_std, D_min, D_max)
+        L_sampler = get_distribution(L_dist, L_mean, L_std, L_min, L_max)
+        e_sampler = get_distribution(epsilon_dist, epsilon_mean, epsilon_std, epsilon_min, epsilon_max)
+        mf_sampler = get_distribution(mass_flow_dist, mass_flow_mean, mass_flow_std, mass_flow_min, mass_flow_max)
+        elev_sampler = get_distribution(elevation_dist, elevation_mean, elevation_std, elevation_min, elevation_max)
+        rho_samples = rho_sampler(num_simulations); mu_samples_mPa = mu_sampler(num_simulations)
+        D_input_samples = D_sampler(num_simulations); L_input_samples = L_sampler(num_simulations)
+        epsilon_samples = e_sampler(num_simulations); mass_flow_samples = mf_sampler(num_simulations)
         elevation_samples = elev_sampler(num_simulations)
-    
-        # Convert units as needed
-        mu_samples = mu_samples_mPa * 1e-3  # Convert from mPa·s to Pa·s (kg/m·s)
-    
-        # Convert diameter, length if needed
-        if st.session_state.units_selected == "Inches":
-            D_samples = D_input_samples * 0.0254  # Convert from inches to meters
-            L_samples = L_input_samples * 0.0254  # Convert from inches to meters
+        mu_samples = mu_samples_mPa * 1e-3
+        if units_selected_run == "Inches":
+            D_samples = D_input_samples * 0.0254; L_samples = L_input_samples * 0.0254
         else:
-            D_samples = D_input_samples  # Already in meters
-            L_samples = L_input_samples  # Already in meters
-    
-        # Clip to avoid zeros or negative values
-        rho_samples = np.clip(rho_samples, a_min=1e-6, a_max=None)
-        mu_samples  = np.clip(mu_samples, a_min=1e-12, a_max=None)
-        D_samples   = np.clip(D_samples, a_min=1e-6, a_max=None)
-        L_samples   = np.clip(L_samples, a_min=1e-6, a_max=None)
-        epsilon_samples = np.clip(epsilon_samples, a_min=1e-12, a_max=None)
-        mass_flow_samples = np.clip(mass_flow_samples, a_min=1e-6, a_max=None)
-    
-        progress_bar.progress(30)
-        status_text.text("Calculating flow parameters...")
-        
-        # Core calculations
-        # 1) Volumetric flow (m³/s)
-        Q_samples = mass_flow_samples / rho_samples  # kg/s ÷ kg/m³ = m³/s
-        
-        # 2) Cross-sectional area (m²)
-        A_samples = np.pi * (D_samples/2) ** 2  # m²
-        
-        # 3) Velocity (m/s)
-        v_samples = Q_samples / A_samples  # m³/s ÷ m² = m/s
-        
-        # 4) Reynolds number (dimensionless)
-        # Re = ρvD/μ where:
-        # ρ = density (kg/m³)
-        # v = velocity (m/s)
-        # D = diameter (m)
-        # μ = dynamic viscosity (Pa·s or kg/m·s)
-        Re_samples = (rho_samples * v_samples * D_samples) / mu_samples  # (kg/m³ × m/s × m) ÷ kg/(m · s) = dimensionless
-        
-        progress_bar.progress(50)
-        status_text.text("Computing friction factors...")
-        
-        # 5) Friction factor (Swamee-Jain) with laminar correction
+            D_samples = D_input_samples; L_samples = L_input_samples
+        rho_samples = np.clip(rho_samples, 1e-6, None); mu_samples = np.clip(mu_samples, 1e-12, None)
+        D_samples = np.clip(D_samples, 1e-6, None); L_samples = np.clip(L_samples, 1e-6, None)
+        epsilon_samples = np.clip(epsilon_samples, 1e-12, None); mass_flow_samples = np.clip(mass_flow_samples, 1e-6, None)
+        progress_bar.progress(30); status_text.text("Calculating flow parameters...")
+        Q_samples = mass_flow_samples / rho_samples; A_samples = np.pi * (D_samples/2)**2; v_samples = Q_samples / A_samples
+        Re_samples = (rho_samples * v_samples * D_samples) / mu_samples
+        progress_bar.progress(50); status_text.text("Computing friction factors...")
         with np.errstate(divide='ignore', invalid='ignore'):
-            f_turbulent = 0.25 / (np.log10((epsilon_samples/(3.7*D_samples)) + (5.74/(Re_samples**0.9))))**2
-        laminar_flow = (Re_samples <= 2000)
-        f_samples = np.where(laminar_flow, 64.0 / Re_samples, f_turbulent)
-        
-        progress_bar.progress(70)
-        status_text.text("Calculating pressure drops...")
-        
-        # 6) Head loss (pipe) in meters of fluid
-        head_loss_pipe = f_samples * (L_samples/D_samples) * (v_samples**2) / (2.0*gravity)  # m
-        
-        # 7) Minor Losses head loss calculation
+            if friction_model == "Churchill (All Regimes)":
+                Re_eff = np.clip(Re_samples, 1e-12, None); rr = epsilon_samples / D_samples
+                A = (2.457 * np.log(1.0 / ((7.0 / Re_eff)**0.9 + 0.27 * rr)))**16; B = (37530.0 / Re_eff)**16
+                f_samples = 8.0 * (((8.0 / Re_eff)**12) + 1.0 / ((A + B)**1.5))**(1/12)
+            elif friction_model == "Blended (Transitional)":
+                f_turbulent = 0.25 / (np.log10((epsilon_samples/(3.7*D_samples)) + (5.74/(Re_samples**0.9))))**2
+                f_lam = 64.0 / Re_samples
+                alpha = (Re_samples - 2000)/2000
+                f_samples = np.where(Re_samples <= 2000, f_lam,
+                               np.where(Re_samples >= 4000, f_turbulent,
+                                        (1-alpha)*f_lam + alpha*f_turbulent))
+            else:
+                f_turbulent = 0.25 / (np.log10((epsilon_samples/(3.7*D_samples)) + (5.74/(Re_samples**0.9))))**2
+                laminar_flow = (Re_samples <= 2000); f_samples = np.where(laminar_flow, 64.0/Re_samples, f_turbulent)
+        progress_bar.progress(70); status_text.text("Calculating pressure drops...")
+        head_loss_pipe = f_samples * (L_samples/D_samples) * (v_samples**2) / (2.0*gravity)
         total_K = 0
-        if not minor_losses_data.empty: # Check if there's any data
-            # Convert list of dicts back to DataFrame for easier processing if needed
+        if not minor_losses_data.empty:
             minor_losses_df = pd.DataFrame(minor_losses_data)
-            # Ensure quantity and k_value are numeric, fill NaNs with 0
             minor_losses_df['quantity'] = pd.to_numeric(minor_losses_df['quantity'], errors='coerce').fillna(0)
             minor_losses_df['k_value'] = pd.to_numeric(minor_losses_df['k_value'], errors='coerce').fillna(0)
-            # Sum K = sum(quantity * k_value) for all rows
             total_K = (minor_losses_df['quantity'] * minor_losses_df['k_value']).sum()
-            
-        head_loss_minor = total_K * (v_samples**2) / (2.0*gravity)  # m
-        
-        # 8) Elevation head in meters of fluid
-        head_loss_elevation = elevation_samples  # m
-        
-        # 9) Total head loss in meters of fluid
-        head_loss_total = head_loss_pipe + head_loss_minor + head_loss_elevation  # m (Use head_loss_minor)
-        
-        # 10) Pressure drop calculation
-        # ΔP = ρgh where:
-        # ρ = density (kg/m³)
-        # g = gravitational acceleration (m/s²)
-        # h = head loss (m)
-        deltaP_samples = rho_samples * gravity * head_loss_total  # kg/m³ × m/s² × m = kg/(m · s²) = Pa
-        
-        progress_bar.progress(80)
-        status_text.text("Finalizing calculations...")
-        
-        # Convert to selected pressure units - Fix unit conversion
+        head_loss_minor = total_K * (v_samples**2) / (2.0*gravity)
+        head_loss_elevation = elevation_samples
+        head_loss_total = head_loss_pipe + head_loss_minor + head_loss_elevation
+        deltaP_samples = rho_samples * gravity * head_loss_total
+        progress_bar.progress(80); status_text.text("Finalizing calculations...")
         if st.session_state.unit_selection == 'psi':
-            deltaP_samples = pa_to_psia(deltaP_samples)
-            pressure_unit = 'psi'
+            deltaP_samples = pa_to_psi(deltaP_samples); pressure_unit = 'psi'
         elif st.session_state.unit_selection == 'kPa':
-            deltaP_samples = deltaP_samples / 1000
-            pressure_unit = 'kPa'
+            deltaP_samples = deltaP_samples / 1000; pressure_unit = 'kPa'
         elif st.session_state.unit_selection == 'bar':
-            deltaP_samples = deltaP_samples / 100000
-            pressure_unit = 'bar'
-        else:  # Default is Pascal
+            deltaP_samples = deltaP_samples / 100000; pressure_unit = 'bar'
+        else:
             pressure_unit = 'Pa'
-            
-        progress_bar.progress(100)
-        status_text.text("Simulation completed successfully!")
-        
-        # --------------------------------------------------------------------------------
-        # RESULTS DISPLAY
-        # --------------------------------------------------------------------------------
+        progress_bar.progress(100); status_text.text("Simulation completed successfully!")
         st.header("Simulation Results")
-        
-        # Create columns for key statistics
         stat_cols = st.columns(4)
-        
-        # Calculate key statistics
-        mean_deltaP = np.mean(deltaP_samples)
-        median_deltaP = np.median(deltaP_samples)
-        std_deltaP = np.std(deltaP_samples)
-        ci_lower = np.percentile(deltaP_samples, (100 - confidence_level)/2)
-        ci_upper = np.percentile(deltaP_samples, confidence_level + (100 - confidence_level)/2)
-        
-        # Display in metric cards
-        with stat_cols[0]:
-            st.metric("Mean Pressure Drop", f"{mean_deltaP:.4g} {pressure_unit}")
-            
-        with stat_cols[1]:
-            st.metric("Median Pressure Drop", f"{median_deltaP:.4g} {pressure_unit}")
-            
-        with stat_cols[2]:
-            st.metric("Standard Deviation", f"{std_deltaP:.4g} {pressure_unit}")
-            
-        with stat_cols[3]:
-            st.metric(f"{confidence_level}% CI Width", f"{ci_upper-ci_lower:.4g} {pressure_unit}")
-        
-        # Show confidence interval as a range
-        st.markdown(f"""
-        <div style="background-color: #e3f2fd; padding: 15px; border-radius: 5px; margin: 10px 0;">
-            <b>{confidence_level}% Confidence Interval:</b> [{ci_lower:.4g}, {ci_upper:.4g}] {pressure_unit}
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Engineering metrics - dimensionless numbers
-        st.subheader("Engineering Parameters (Averages)")
-        eng_cols = st.columns(3)
-        
-        with eng_cols[0]:
-            mean_re = np.mean(Re_samples)
-            st.metric("Reynolds Number", f"{mean_re:.3g}")
-            
-            # Show a more detailed tooltip about Reynolds number
-            st.markdown("""
-            <div style="font-size: 0.85em; color: #666;">
-            Re = ρvD/μ (density × velocity × diameter ÷ viscosity)
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # More accurate flow regime classification with clear breakpoints
-            if (mean_re < 2000):
-                flow_regime = "Laminar"
-                re_icon = "➡️"
-                regime_detail = "Smooth, orderly flow with parallel streamlines"
-            elif (mean_re < 4000):
-                flow_regime = "Transitional"
-                re_icon = "↔️"
-                regime_detail = "Mix of laminar and turbulent characteristics"
-            else:
-                flow_regime = "Turbulent"
-                re_icon = "🌊"
-                regime_detail = "Chaotic flow with eddies and vortices"
-                
-            # Also show percentage of samples in each regime for more insight
-            pct_laminar = np.mean(Re_samples < 2000) * 100
-            pct_transitional = np.mean((Re_samples >= 2000) & (Re_samples < 4000)) * 100
-            pct_turbulent = np.mean(Re_samples >= 4000) * 100
-            
-            st.markdown(f"Flow Regime: {re_icon} **{flow_regime}** <br><small>{regime_detail}</small>", unsafe_allow_html=True)
-            
-            # Only show detailed breakdown if there's a mix of regimes or specific threshold
-            if min(pct_laminar, pct_turbulent) > 5 or pct_transitional > 20:
-                st.markdown(f"""<small>
-                Distribution: {pct_laminar:.1f}% Laminar, 
-                {pct_transitional:.1f}% Transitional, 
-                {pct_turbulent:.1f}% Turbulent</small>""", unsafe_allow_html=True)
-        
-        with eng_cols[1]:
-            st.metric("Friction Factor", f"{np.mean(f_samples):.5g}")
-            # Add unit clarification
-            st.markdown(f"""
-            <div style="font-size: 0.85em; color: #666;">
-            Dimensionless coefficient in Darcy-Weisbach equation
-            </div>
-            """, unsafe_allow_html=True)
-            st.markdown(f"ε/D: **{np.mean(epsilon_samples/D_samples):.2g}** <small>(Relative roughness)</small>", unsafe_allow_html=True)
-            
-        with eng_cols[2]:
-            st.metric("Flow Velocity", f"{np.mean(v_samples):.3g} m/s")
-            velocity_level = "High" if np.mean(v_samples) > 3.0 else "Moderate" if np.mean(v_samples) > 1.5 else "Low"
-            st.markdown(f"Velocity Level: **{velocity_level}**")
-            
-            # Add unit conversion for convenience
-            fps_velocity = np.mean(v_samples) * 3.28084
-            st.markdown(f"<small>({fps_velocity:.3g} ft/s)</small>", unsafe_allow_html=True)
-        
-        # Tabbed visualization of results
-        viz_tab1, viz_tab2, viz_tab3, viz_tab4 = st.tabs([
-            "📊 Histogram", "📈 CDF", "🔄 Sensitivity", "📑 Data Table"
-        ])
-        
-        # Tab 1: Improved histogram
-        with viz_tab1:
-            hist_fig, hist_ax = plt.subplots(figsize=(10, 6))
-            
-            # Create histogram with KDE
-            hist_ax.hist(
-                deltaP_samples, 
-                bins=50, 
-                color=COLORS["primary"], 
-                edgecolor='white', 
-                alpha=0.7,
-                density=True
-            )
-            
-            # Add a KDE line
-            from scipy.stats import gaussian_kde
-            kde = gaussian_kde(deltaP_samples)
-            x = np.linspace(min(deltaP_samples), max(deltaP_samples), 1000)
-            hist_ax.plot(x, kde(x), color=COLORS["secondary"], linewidth=2)
-            
-            # Add mean and CI markers
-            hist_ax.axvline(mean_deltaP, color=COLORS["highlight"], linestyle='-', linewidth=2, label=f'Mean: {mean_deltaP:.4g} {pressure_unit}')
-            hist_ax.axvline(ci_lower, color=COLORS["highlight"], linestyle='--', linewidth=1.5, label=f'{confidence_level}% CI Lower: {ci_lower:.4g} {pressure_unit}')
-            hist_ax.axvline(ci_upper, color=COLORS["highlight"], linestyle='--', linewidth=1.5, label=f'{confidence_level}% CI Upper: {ci_upper:.4g} {pressure_unit}')
-            
-            # Format axes and add title/labels
-            hist_ax.set_xlabel(f'Pressure Drop ({pressure_unit})', fontsize=12)
-            hist_ax.set_ylabel('Probability Density', fontsize=12)
-            hist_ax.set_title('Pressure Drop Distribution', fontsize=14, fontweight='bold')
-            hist_ax.grid(True, linestyle='--', alpha=0.7)
-            hist_ax.legend(loc='best')
-            
-            # Add annotations
-            hist_ax.annotate(
-                f"n = {num_simulations}\nμ = {mean_deltaP:.4g} {pressure_unit}\nσ = {std_deltaP:.4g} {pressure_unit}", 
-                xy=(0.03, 0.92), 
-                xycoords='axes fraction',
-                bbox=dict(boxstyle="round,pad=0.5", facecolor='white', alpha=0.8)
-            )
-            
-            hist_ax.annotate(
-                f"n = {num_simulations}\nμ = {mean_deltaP:.4g} {pressure_unit}\nσ = {std_deltaP:.4g} {pressure_unit}", 
-                xy=(0.03, 0.92), 
-                xycoords='axes fraction',
-                bbox=dict(boxstyle="round,pad=0.5", facecolor='white', alpha=0.8)
-            )
-            
-            hist_fig.tight_layout()
-            st.pyplot(hist_fig)
-            
-        # Tab 2: Improved CDF
-        with viz_tab2:
-            cdf_fig, cdf_ax = plt.subplots(figsize=(10, 6))
-            
-            # Sort data for CDF
-            sorted_deltaP = np.sort(deltaP_samples)
-            cdf = np.arange(1, num_simulations+1)/num_simulations
-            
-            # Plot CDF with engineering styling
-            cdf_ax.plot(sorted_deltaP, cdf, color=COLORS["primary"], linewidth=2.5)
-            
-            # Add confidence interval
-            cdf_ax.axvline(ci_lower, color=COLORS["highlight"], linestyle='--', linewidth=1.5)
-            cdf_ax.axhline((100-confidence_level)/200, color=COLORS["highlight"], linestyle=':', linewidth=1)
-            cdf_ax.axvline(ci_upper, color=COLORS["highlight"], linestyle='--', linewidth=1.5)
-            cdf_ax.axhline(1-((100-confidence_level)/200), color=COLORS["highlight"], linestyle=':', linewidth=1)
-            
-            # Fill confidence interval region
-            idx_lower = np.searchsorted(sorted_deltaP, ci_lower)
-            idx_upper = np.searchsorted(sorted_deltaP, ci_upper)
-            cdf_ax.fill_between(
-                sorted_deltaP[idx_lower:idx_upper+1], 
-                cdf[idx_lower:idx_upper+1], 
-                color=COLORS["primary"], 
-                alpha=0.2,
-                label=f'{confidence_level}% Confidence Interval'
-            )
-            
-            # Format axes and title/labels
-            cdf_ax.set_xlabel(f'Pressure Drop ({pressure_unit})', fontsize=12)
-            cdf_ax.set_ylabel('Cumulative Probability', fontsize=12)
-            cdf_ax.set_title('Cumulative Distribution Function', fontsize=14, fontweight='bold')
-            cdf_ax.grid(True, linestyle='--', alpha=0.7)
-            
-            # Add percentile lines
-            for p in [0.1, 0.25, 0.5, 0.75, 0.9]:
-                percentile_val = np.percentile(deltaP_samples, p*100)
-                cdf_ax.plot([percentile_val, percentile_val], [0, p], 'k:', linewidth=0.8, alpha=0.6)
-                cdf_ax.plot([min(deltaP_samples), percentile_val], [p, p], 'k:', linewidth=0.8, alpha=0.6)
-                cdf_ax.annotate(
-                    f"{int(p*100)}%", 
-                    xy=(percentile_val, 0.02), 
-                    xytext=(0, 5), 
-                    textcoords='offset points',
-                    ha='center', 
-                    fontsize=8
-                )
-            
-            cdf_fig.tight_layout()
-            st.pyplot(cdf_fig)
-            
-        # Tab 3: Enhanced sensitivity analysis
-        with viz_tab3:
-            # Create dataframe with all parameters and results
-            data = pd.DataFrame({
-                'Pressure Drop': deltaP_samples,
-                'Density (kg/m³)': rho_samples,
-                'Viscosity (Pa·s)': mu_samples,
-                f'Diameter ({st.session_state.units_selected})': D_input_samples,
-                f'Length ({st.session_state.units_selected})': L_input_samples,
-                'Roughness (m)': epsilon_samples,
-                'Mass Flow Rate (kg/s)': mass_flow_samples,
-                'Elevation Change (m)': elevation_samples,
-                'Reynolds Number': Re_samples,
-                'Friction Factor': f_samples,
-                'Velocity (m/s)': v_samples
-            })
-            
-            # Calculate correlation matrix
-            corr_matrix = data.corr()
-            pressure_drop_corr = corr_matrix['Pressure Drop'].drop('Pressure Drop').sort_values(key=abs, ascending=False)
-            
-            # Create two-column layout
-            sens_col1, sens_col2 = st.columns([2, 1])
-            
-            with sens_col1:
-                # Enhanced correlation bar chart
-                sens_fig, sens_ax = plt.subplots(figsize=(10, 6))
-                
-                # Plot bars with color based on value
-                bars = pressure_drop_corr.plot(
-                    kind='barh', 
-                    ax=sens_ax,
-                    color=[COLORS["primary"] if x > 0 else COLORS["highlight"] for x in pressure_drop_corr]
-                )
-                
-                # Add value labels to bars
-                for i, v in enumerate(pressure_drop_corr):
-                    sens_ax.text(
-                        v + (0.01 if v >= 0 else -0.01), 
-                        i, 
-                        f'{v:.3f}', 
-                        va='center', 
-                        ha='left' if v >= 0 else 'right',
-                        fontweight='bold'
-                    )
-                
-                # Format axes and title/labels
-                sens_ax.set_xlabel('Correlation Coefficient', fontsize=12)
-                sens_ax.set_title('Parameter Sensitivity Analysis', fontsize=14, fontweight='bold')
-                sens_ax.grid(True, linestyle='--', alpha=0.7, axis='x')
-                sens_ax.set_axisbelow(True)
-                
-                # Add reference line at zero
-                sens_ax.axvline(0, color='gray', linewidth=0.8)
-                
-                # Add interpretation zone labels - Fixed positioning to avoid overlap
-                sens_ax.text(0.85, -0.15, 'Strong +', ha='center', transform=sens_ax.transAxes, fontsize=8)
-                sens_ax.text(0.5, -0.15, 'Moderate +', ha='center', transform=sens_ax.transAxes, fontsize=8)
-                sens_ax.text(-0.85, -0.15, 'Strong -', ha='center', transform=sens_ax.transAxes, fontsize=8)
-                sens_ax.text(-0.5, -0.15, 'Moderate -', ha='center', transform=sens_ax.transAxes, fontsize=8)
-                
-                # Ensure plot has enough bottom margin to display these labels
-                plt.subplots_adjust(bottom=0.15)
-                
-                sens_fig.tight_layout()
-                st.pyplot(sens_fig)
-                
-            with sens_col2:
-                # Correlation table with color formatting
-                st.subheader("Correlation Coefficients")
-                
-                # Format table with styling
-                pd_corr = pd.DataFrame(pressure_drop_corr).reset_index()
-                pd_corr.columns = ['Parameter', 'Correlation']
-                
-                # Apply background gradient to corr values
-                st.dataframe(pd_corr.style.background_gradient(
-                    cmap='RdBu_r', subset=['Correlation'], vmin=-1, vmax=1
-                 ))
-                
-                # Add interpretation
-                st.subheader("Interpretation")
-                
-                # Find strongest correlations
-                strongest_pos = pd_corr.loc[pd_corr['Correlation'] == pd_corr['Correlation'].max()]
-                strongest_neg = pd_corr.loc[pd_corr['Correlation'] == pd_corr['Correlation'].min()]
-                
-                # Safely format insight strings
-                pos_insight = "No significant positive correlation found."
-                if not strongest_pos.empty:
-                    pos_param = strongest_pos['Parameter'].values[0]
-                    pos_corr = strongest_pos['Correlation'].values[0]
-                    pos_insight = f"• <b>{pos_param}</b> has the strongest <b>positive</b> effect on pressure drop ({pos_corr:.3f})"
+        mean_deltaP = np.mean(deltaP_samples); median_deltaP = np.median(deltaP_samples); std_deltaP = np.std(deltaP_samples)
+        ci_lower = np.percentile(deltaP_samples, (100 - confidence_level)/2); ci_upper = np.percentile(deltaP_samples, confidence_level + (100 - confidence_level)/2)
+        stat_cols[0].metric("Mean Pressure Drop", f"{mean_deltaP:.4g} {pressure_unit}")
+        stat_cols[1].metric("Median Pressure Drop", f"{median_deltaP:.4g} {pressure_unit}")
+        stat_cols[2].metric("Standard Deviation", f"{std_deltaP:.4g} {pressure_unit}")
+        stat_cols[3].metric(f"{confidence_level}% CI Width", f"{(ci_upper-ci_lower):.4g} {pressure_unit}")
+        st.markdown(f"<div style='background-color: #e3f2fd; padding: 15px; border-radius: 5px; margin: 10px 0;'><b>{confidence_level}% Confidence Interval:</b> [{ci_lower:.4g}, {ci_upper:.4g}] {pressure_unit}</div>", unsafe_allow_html=True)
+        st.subheader("Distributions & Sensitivity")
+        # Build DataFrame of simulation outputs and key inputs
+        data = pd.DataFrame({
+            'Pressure Drop': deltaP_samples,
+            f'Diameter ({units_selected_run})': D_input_samples,
+            f'Length ({units_selected_run})': L_input_samples,
+            'Roughness (m)': epsilon_samples,
+            'Mass Flow Rate (kg/s)': mass_flow_samples,
+            'Elevation Change (m)': elevation_samples,
+            'Reynolds Number': Re_samples,
+            'Friction Factor': f_samples,
+            'Velocity (m/s)': v_samples
+        })
 
-                neg_insight = "No significant negative correlation found."
-                if not strongest_neg.empty:
-                    neg_param = strongest_neg['Parameter'].values[0]
-                    neg_corr = strongest_neg['Correlation'].values[0]
-                    neg_insight = f"• <b>{neg_param}</b> has the strongest <b>negative</b> effect on pressure drop ({neg_corr:.3f})"
+        # Histogram
+        hist_fig, hist_ax = plt.subplots()
+        hist_ax.hist(deltaP_samples, bins=50, color=COLORS['primary'], alpha=0.75, edgecolor='black')
+        hist_ax.axvline(mean_deltaP, color='black', linestyle='--', label=f"Mean {mean_deltaP:.3g}")
+        hist_ax.axvspan(ci_lower, ci_upper, color=COLORS['secondary'], alpha=0.2,
+                        label=f"{confidence_level}% CI")
+        hist_ax.set_title("Pressure Drop Distribution")
+        hist_ax.set_xlabel(f"Pressure Drop ({pressure_unit})")
+        hist_ax.set_ylabel("Frequency")
+        hist_ax.legend()
+        st.pyplot(hist_fig)
 
-                st.markdown(f"""
-                <div style="background-color: #e8f5e9; padding: 10px; border-radius: 5px; margin: 10px 0;">
-                    <b>Key Insights:</b><br>
-                    {pos_insight}<br><br>
-                    {neg_insight}
-                </div>
-                """, unsafe_allow_html=True)
-                
-                # Engineering guidance based on correlations
-                # Check if the key exists before accessing
-                if 'Mass Flow Rate (kg/s)' in pressure_drop_corr and abs(pressure_drop_corr['Mass Flow Rate (kg/s)']) > 0.5:
-                    st.info("💡 Mass flow rate is a key driver of pressure drop; consider flow control strategies.")
-                    
-                diameter_key = f'Diameter ({st.session_state.units_selected})'
-                if diameter_key in pressure_drop_corr and abs(pressure_drop_corr[diameter_key]) > 0.5:
-                    st.info("💡 Pipe diameter significantly affects pressure drop; a small increase in diameter can greatly reduce pressure losses.")
-                
-        # Tab 4: Data table with aggregated results
-        with viz_tab4:
-            # Create summary statistics of all parameters
-            summary_stats = pd.DataFrame({
-                'Parameter': data.columns,
-                'Mean': data.mean(),
-                'Std Dev': data.std(),
-                'Min': data.min(),
-                'Max': data.max(),
-                '5%': data.quantile(0.05),
-                '95%': data.quantile(0.95)
-            })
-            
-            st.subheader("Parameter Statistics")
-            # Fix: Use pandas formatting options instead of style formatter
-            # Round numeric columns to 4 significant digits
-            formatted_stats = summary_stats.copy()
-            numeric_cols = formatted_stats.select_dtypes(include=['float64', 'int64']).columns
-            for col in numeric_cols:
+        # CDF plot
+        cdf_fig, cdf_ax = plt.subplots()
+        sorted_dp = np.sort(deltaP_samples)
+        cdf = np.linspace(0, 1, len(sorted_dp))
+        cdf_ax.plot(sorted_dp, cdf, color=COLORS['primary'])
+        cdf_ax.set_title("Pressure Drop Empirical CDF")
+        cdf_ax.set_xlabel(f"Pressure Drop ({pressure_unit})")
+        cdf_ax.set_ylabel("Cumulative Probability")
+        st.pyplot(cdf_fig)
+
+        # Correlation / sensitivity
+        corr_matrix = data.corr(numeric_only=True)
+        pressure_drop_corr = corr_matrix['Pressure Drop'].drop('Pressure Drop').sort_values(key=lambda s: s.abs(), ascending=False)
+        sens_col1, sens_col2 = st.columns([2,1])
+        with sens_col1:
+            sens_fig, sens_ax = plt.subplots(figsize=(8,6))
+            pressure_drop_corr.plot(kind='barh', ax=sens_ax, color=[COLORS['primary'] if x>0 else COLORS['highlight'] for x in pressure_drop_corr])
+            sens_ax.set_xlabel('Correlation Coefficient')
+            sens_ax.set_title('Parameter Sensitivity (Linear Corr)')
+            sens_ax.axvline(0, color='gray', linewidth=0.8)
+            sens_fig.tight_layout()
+            st.pyplot(sens_fig)
+        with sens_col2:
+            st.subheader("Correlations")
+            pd_corr = pd.DataFrame(pressure_drop_corr).reset_index()
+            pd_corr.columns = ['Parameter','Correlation']
+            st.dataframe(pd_corr.style.background_gradient(cmap='RdBu_r', subset=['Correlation'], vmin=-1, vmax=1), use_container_width=True)
+            strongest_pos = pd_corr.loc[pd_corr['Correlation'] == pd_corr['Correlation'].max()]
+            strongest_neg = pd_corr.loc[pd_corr['Correlation'] == pd_corr['Correlation'].min()]
+            pos_insight = "No significant positive correlation found." if strongest_pos.empty else f"• <b>{strongest_pos['Parameter'].values[0]}</b> strongest positive ({strongest_pos['Correlation'].values[0]:.3f})"
+            neg_insight = "No significant negative correlation found." if strongest_neg.empty else f"• <b>{strongest_neg['Parameter'].values[0]}</b> strongest negative ({strongest_neg['Correlation'].values[0]:.3f})"
+            st.markdown(f"<div style='background-color:#e8f5e9;padding:10px;border-radius:5px;margin:10px 0;'><b>Key Insights:</b><br>{pos_insight}<br><br>{neg_insight}</div>", unsafe_allow_html=True)
+
+        # Summary statistics
+        st.subheader("Parameter Statistics")
+        summary_stats = pd.DataFrame({
+            'Parameter': data.columns,
+            'Mean': data.mean(),
+            'Std Dev': data.std(),
+            'Min': data.min(),
+            'Max': data.max(),
+            '5%': data.quantile(0.05),
+            '95%': data.quantile(0.95)
+        })
+        formatted_stats = summary_stats.copy()
+        numeric_cols = formatted_stats.select_dtypes(include=['float64','int64']).columns
+        for col in numeric_cols:
+            if col != 'Parameter':
                 formatted_stats[col] = formatted_stats[col].apply(lambda x: f"{x:.4g}")
-            st.dataframe(formatted_stats)
-            
-            # Provide a sample of the raw data
-            st.subheader("Sample Data (First 10 Simulations)")
-            # Also fix formatting for the sample data
-            sample_data = data.head(10).copy()
-            for col in sample_data.select_dtypes(include=['float64', 'int64']).columns: # Added closing parenthesis
-                sample_data[col] = sample_data[col].apply(lambda x: f"{x:.4g}")
-            st.dataframe(sample_data)
-            
-            # Excel export button
-            st.subheader("Export Results")
-            
-            # Function to build Excel with embedded figures
-            def to_excel(sim_data, summary_data, sensitivity_data, hist_fig, cdf_fig, sens_fig, minor_losses_df):
-                out_xlsx = io.BytesIO()
-                with pd.ExcelWriter(out_xlsx, engine='xlsxwriter') as writer:
-                    # Write minor losses data to its own sheet
-                    minor_losses_df.to_excel(writer, sheet_name='Minor Losses', index=False)
-                    # Write sheets
-                    sim_data.to_excel(writer, sheet_name='Simulation Data', index=False)
-                    summary_data.to_excel(writer, sheet_name='Summary', index=False)
-                    sensitivity_data.to_excel(writer, sheet_name='Sensitivity', index=False)
-                    
-                    # Insert images into Summary
-                    workbook = writer.book
-                    summary_ws = writer.sheets['Summary']
-                    
-                    # Add some additional formatting
-                    header_format = workbook.add_format({
-                        'bold': True, 
-                        'bg_color': '#4285F4', 
-                        'font_color': 'white',
-                        'border': 1
-                    })
-                    
-                    # Format headers in each sheet
-                    for col_num, value in enumerate(summary_data.columns.values):
-                        summary_ws.write(0, col_num, value, header_format)
-                    
-                    # Histogram
-                    png_hist = io.BytesIO()
-                    hist_fig.savefig(png_hist, format='png', bbox_inches='tight')
-                    png_hist.seek(0)
-                    summary_ws.insert_image('D10', 'Histogram', {'image_data': png_hist})
-                    
-                    # CDF
-                    png_cdf = io.BytesIO()
-                    cdf_fig.savefig(png_cdf, format='png', bbox_inches='tight')
-                    png_cdf.seek(0)
-                    summary_ws.insert_image('D30', 'CDF', {'image_data': png_cdf})
-                    
-                    # Sensitivity
-                    png_sens = io.BytesIO()
-                    sens_fig.savefig(png_sens, format='png', bbox_inches='tight')
-                    png_sens.seek(0)
-                    summary_ws.insert_image('D50', 'Sensitivity', {'image_data': png_sens})
-                    
-                    # Add summary at the top
-                    summary_ws.write('A1', 'Pressure Drop Simulation Results', workbook.add_format({
-                        'bold': True, 
-                        'font_size': 14
-                    }))
-                    summary_ws.write('A2', f'Fluid: {selected_fluid}, Simulations: {num_simulations}')
-                    summary_ws.write('A4', 'Key Statistics:')
-                    summary_ws.write('A5', f'Mean Pressure Drop: {mean_deltaP:.4g} {pressure_unit}')
-                    summary_ws.write('A6', f'Standard Deviation: {std_deltaP:.4g} {pressure_unit}')
-                    summary_ws.write('A7', f'{confidence_level}% Confidence Interval: [{ci_lower:.4g}, {ci_upper:.4g}] {pressure_unit}')
-                
-                return out_xlsx.getvalue()
-            
-            # Prepare minor losses DataFrame for export
-            minor_losses_df_export = pd.DataFrame(minor_losses_data) \
-                if not minor_losses_data.empty else pd.DataFrame(
-                    columns=['component_type','quantity','k_value']
-                )
-            # Build Excel file
-            excel_file = to_excel(
-                data,
-                summary_stats,
-                pd.DataFrame(pressure_drop_corr).reset_index(),
-                hist_fig,
-                cdf_fig,
-                sens_fig,
-                minor_losses_df_export
-            )
-            
-            # Create a prominent button for download
-            st.download_button(
-                label="📊 Download Complete Results (Excel)",
-                data=excel_file,
-                # file_name=f'pressure_drop_{selected_fluid}_{num_simulations}sims.xlsx', # Original f-string
-                file_name='pressure_drop_{}_{}sims.xlsx'.format(selected_fluid, num_simulations), # Using .format()
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                use_container_width=True
-            )
-            
+        st.dataframe(formatted_stats, use_container_width=True)
+
+        # Sample data
+        st.subheader("Sample Data (First 10 Simulations)")
+        sample_data = data.head(10).copy()
+        for col in sample_data.select_dtypes(include=['float64','int64']).columns:
+            sample_data[col] = sample_data[col].apply(lambda x: f"{x:.4g}")
+        st.dataframe(sample_data, use_container_width=True)
+
+        # Export
+        st.subheader("Export Results")
+        def to_excel(sim_data, summary_data, sensitivity_data, hist_fig, cdf_fig, sens_fig, minor_losses_df):
+            out_xlsx = io.BytesIO()
+            with pd.ExcelWriter(out_xlsx, engine='xlsxwriter') as writer:
+                minor_losses_df.to_excel(writer, sheet_name='Minor Losses', index=False)
+                sim_data.to_excel(writer, sheet_name='Simulation Data', index=False)
+                sensitivity_data.to_excel(writer, sheet_name='Sensitivity', index=False)
+                summary_data.to_excel(writer, sheet_name='Summary', index=False, startrow=9)
+                workbook = writer.book; summary_ws = writer.sheets['Summary']
+                summary_ws.write('A1', 'Pressure Drop Simulation Results', workbook.add_format({'bold': True, 'font_size': 14}))
+                summary_ws.write('A2', f'Fluid: {selected_fluid}, Simulations: {num_simulations}')
+                summary_ws.write('A4', 'Key Statistics:')
+                summary_ws.write('A5', f'Mean Pressure Drop: {mean_deltaP:.4g} {pressure_unit}')
+                summary_ws.write('A6', f'Standard Deviation: {std_deltaP:.4g} {pressure_unit}')
+                summary_ws.write('A7', f'{confidence_level}% Confidence Interval: [{ci_lower:.4g}, {ci_upper:.4g}] {pressure_unit}')
+                png_hist = io.BytesIO(); hist_fig.savefig(png_hist, format='png', bbox_inches='tight'); png_hist.seek(0); summary_ws.insert_image('D2','Histogram',{'image_data': png_hist})
+                png_cdf = io.BytesIO(); cdf_fig.savefig(png_cdf, format='png', bbox_inches='tight'); png_cdf.seek(0); summary_ws.insert_image('D22','CDF',{'image_data': png_cdf})
+                png_sens = io.BytesIO(); sens_fig.savefig(png_sens, format='png', bbox_inches='tight'); png_sens.seek(0); summary_ws.insert_image('D42','Sensitivity',{'image_data': png_sens})
+            return out_xlsx.getvalue()
+        minor_losses_df_export = pd.DataFrame(minor_losses_data) if not minor_losses_data.empty else pd.DataFrame(columns=['component_type','quantity','k_value'])
+        excel_file = to_excel(data, summary_stats, pd.DataFrame(pressure_drop_corr).reset_index(), hist_fig, cdf_fig, sens_fig, minor_losses_df_export)
+        st.download_button(label="📊 Download Complete Results (Excel)", data=excel_file, file_name=f'pressure_drop_{selected_fluid}_{num_simulations}sims.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', use_container_width=True)
     else:
-        # Message for when no simulation has been run
         st.info("Run a simulation first to see results here.")
         if st.button("⚙️ Go to Simulation Setup", on_click=switch_to_setup):
             pass
@@ -1491,7 +1166,7 @@ else:
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #666;">
-    <small>Engineering Monte Carlo Pressure Drop Calculator • v2.5 • Using CoolProp</small>
+    <small>Engineering Monte Carlo Pressure Drop Calculator • v2.6 • Using CoolProp</small>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1508,10 +1183,14 @@ with st.expander("📐 View Equations Used", expanded=False):
     st.latex(r"Re = \frac{\rho \, v \, D}{\mu} \quad [\frac{kg/m^3 \times m/s \times m}{kg/(m \cdot s)} = \text{dimensionless}]")
     
     st.markdown("**Friction Factor (Swamee-Jain for turbulent flow):**")
-    st.latex(r"f = 0.25 \Big/ \left[\log_{10}\!\Bigl(\frac{\epsilon}{3.7\,D} + \frac{5.74}{Re^{0.9}}\Bigr)\right]^2 \quad [\text{dimensionless}]")
-    
+    st.latex(r"f = 0.25 \Big/ \left[\log_{10}\!\Bigl(\frac{\epsilon}{3.7\,D} + \frac{5.74}{Re^{0.9}}\Bigr)\right]^2")
+
     st.markdown("**Friction Factor (laminar flow):**")
-    st.latex(r"f = \frac{64}{Re} \quad \text{for} \quad Re \leq 2000 \quad [\text{dimensionless}]")
+    st.latex(r"f = \frac{64}{Re} \quad (Re \leq 2000)")
+
+    st.markdown("**Churchill Universal Friction Factor (All Regimes):**")
+    st.latex(r"f = 8 \left[\left(\frac{8}{Re}\right)^{12} + \frac{1}{\left(A + B\right)^{1.5}}\right]^{1/12}")
+    st.latex(r"A = \left[2.457 \ln \left( \frac{1}{ (7/Re)^{0.9} + 0.27\, (\epsilon/D) } \right) \right]^{16} \quad B = \left(\frac{37530}{Re}\right)^{16}")
     
     st.markdown("**Head Loss (Darcy-Weisbach):**")
     st.latex(r"h_f = f\,\frac{L}{D}\,\frac{v^2}{2g} \quad [\text{dimensionless} \times \frac{m}{m} \times \frac{(m/s)^2}{m/s^2} = m]")
