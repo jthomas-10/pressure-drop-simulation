@@ -190,7 +190,7 @@ st.title("Pressure Drop Monte Carlo Simulation")
 st.markdown("""
 <div style="background-color: #e3f2fd; padding: 10px; border-left: 5px solid #1f77b4; margin-bottom: 20px;">
 This application conducts Monte Carlo simulations to analyze the uncertainty of <b>pressure drop</b> in pipe flow scenarios
-using the <b>Darcy-Weisbach</b> equation and <b>CoolProp</b> for accurate fluid properties.
+using <b>CoolProp</b> for accurate fluid properties.
 </div>
 """, unsafe_allow_html=True)
 
@@ -245,18 +245,14 @@ def create_distribution_inputs(label, default_value_for_mean, unit, key_prefix, 
         dist_key = f"{key_prefix}_dist"
         dist_options = ['Deterministic', 'Normal', 'Uniform', 'Triangular']
         
-        # Ensure session state exists before creating widget
+        # Initialize session state if not exists
         if dist_key not in st.session_state:
-            st.session_state[dist_key] = default_dist # Use the passed default
-            
-        # Use session state's value to find the index for display (but don't pass index to widget)
-        # current_dist_index = dist_options.index(st.session_state.get(dist_key, default_dist)) # No longer needed
+            st.session_state[dist_key] = default_dist
 
         dist = st.selectbox(
             f"{label} Distribution",
             dist_options,
-            # index=current_dist_index, # REMOVED
-            key=dist_key # Let Streamlit manage the state of the selectbox via key
+            key=dist_key  # Let Streamlit manage the state entirely
         )
 
         if tooltip:
@@ -268,25 +264,16 @@ def create_distribution_inputs(label, default_value_for_mean, unit, key_prefix, 
         min_key = f"{key_prefix}_min"
         max_key = f"{key_prefix}_max"
 
-        # --- Revised Logic --- 
-        # 1. Determine the value to display/use, ALWAYS prioritizing session state if it exists.
-        #    The 'default_value_for_mean' is only used if the session state key is not yet set.
-        mean_value_to_use = st.session_state.get(mean_key, default_value_for_mean)
+        # Initialize mean value in session state if not exists
+        if mean_key not in st.session_state:
+            st.session_state[mean_key] = default_value_for_mean
 
-        # 2. Update session state BEFORE creating the widget to ensure consistency.
-        st.session_state[mean_key] = mean_value_to_use
-        # --- End Revised Logic ---
-
-        # 3. Create the number input widget using the determined value FROM SESSION STATE.
-        #    Remove the 'value=' argument to avoid the warning.
         # Dynamic label: Mode for Triangular, Mean otherwise
         dynamic_label = "Mode" if dist == 'Triangular' else "Mean"
         mean = st.number_input(
             f"{dynamic_label} ({unit})",
-            # value=mean_value_to_use, # REMOVED: Value is taken from session state via key
             format="%.4g",
-            key=mean_key, # Key remains the same
-            # disabled=(dist == 'Deterministic') # Optional: uncomment to disable editing if deterministic
+            key=mean_key  # Only use key, no value parameter
         )
 
         # Handle std, min, max based on distribution type
@@ -295,40 +282,38 @@ def create_distribution_inputs(label, default_value_for_mean, unit, key_prefix, 
         max_val = 0.0
 
         if dist == 'Normal':
-            # Use the default_std passed in if available, otherwise calculate 5% (using the *current* mean_value_to_use)
-            std_default_value = default_std if default_std is not None else mean_value_to_use * 0.05
-            # Get value from session state or use the calculated default
-            std_value_to_display = st.session_state.get(std_key, std_default_value)
-            st.session_state[std_key] = std_value_to_display # Update state
+            # Initialize std in session state if not exists
+            if std_key not in st.session_state:
+                # Use the default_std passed in if available, otherwise calculate 5%
+                current_mean = st.session_state[mean_key]
+                st.session_state[std_key] = default_std if default_std is not None else current_mean * 0.05
+            
             std = st.number_input(
                 f"Std Dev ({unit})",
-                # value=std_value_to_display, # REMOVED
                 format="%.4g",
                 key=std_key
             )
         elif dist in ['Uniform', 'Triangular']:
-            # Use default_min/max if passed, otherwise calculate +/- 10% (using the *current* mean_value_to_use)
-            min_default_value = default_min if default_min is not None else mean_value_to_use * 0.9
-            max_default_value = default_max if default_max is not None else mean_value_to_use * 1.1
-
-            min_value_to_display = st.session_state.get(min_key, min_default_value)
-            max_value_to_display = st.session_state.get(max_key, max_default_value)
-            st.session_state[min_key] = min_value_to_display # Update state
-            st.session_state[max_key] = max_value_to_display # Update state
+            # Initialize min/max in session state if not exists
+            if min_key not in st.session_state:
+                current_mean = st.session_state[mean_key]
+                st.session_state[min_key] = default_min if default_min is not None else current_mean * 0.9
+            if max_key not in st.session_state:
+                current_mean = st.session_state[mean_key]
+                st.session_state[max_key] = default_max if default_max is not None else current_mean * 1.1
+            
             min_val = st.number_input(
                 f"Min ({unit})",
-                # value=min_value_to_display, # REMOVED
                 format="%.4g",
                 key=min_key
             )
             max_val = st.number_input(
                 f"Max ({unit})",
-                # value=max_value_to_display, # REMOVED
                 format="%.4g",
                 key=max_key
             )
 
-    # Return the *current* values from the widgets/state
+    # Return the current values from session state
     return dist, mean, std, min_val, max_val
 
 # Set up tab switching function
@@ -423,20 +408,9 @@ def render_fluid_section():
         default_rho_std = calc_density * 0.05
         default_mu_std = calc_viscosity_mPas * 0.05
 
-        # --- Check and Force Update for Deterministic Fluid Properties --- 
-        rho_dist_current = st.session_state.get('rho_dist', 'Deterministic')
-        if rho_dist_current == 'Deterministic':
-            st.session_state['rho_mean'] = calc_density # Force update state to CoolProp value
-        
-        mu_dist_current = st.session_state.get('mu_dist', 'Deterministic')
-        if mu_dist_current == 'Deterministic':
-             st.session_state['mu_mean'] = calc_viscosity_mPas # Force update state to CoolProp value
-        # --- End Check --- 
-
         rho_dist, rho_mean, rho_std, rho_min, rho_max = create_distribution_inputs(
             "Density", calc_density, "kg/m³", "rho",
-            default_dist=rho_dist_current, # Use the potentially updated state
-            # default_mean is handled by the logic within create_distribution_inputs now
+            default_dist=st.session_state.get('rho_dist', 'Deterministic'),
             default_std=st.session_state.get('rho_std', default_rho_std), 
             default_min=st.session_state.get('rho_min', None),
             default_max=st.session_state.get('rho_max', None),
@@ -445,8 +419,7 @@ def render_fluid_section():
         
         mu_dist, mu_mean, mu_std, mu_min, mu_max = create_distribution_inputs(
             "Viscosity", calc_viscosity_mPas, "mPa·s", "mu",
-            default_dist=mu_dist_current, # Use the potentially updated state
-            # default_mean is handled by the logic within create_distribution_inputs now
+            default_dist=st.session_state.get('mu_dist', 'Deterministic'),
             default_std=st.session_state.get('mu_std', default_mu_std), 
             default_min=st.session_state.get('mu_min', None),
             default_max=st.session_state.get('mu_max', None),
@@ -528,26 +501,27 @@ def render_minor_losses_section():
                 if comp_k_key not in st.session_state:
                      st.session_state[comp_k_key] = st.session_state.minor_losses_state[comp]['k_value']
 
-            # entry = st.session_state.minor_losses_state[comp] # Not needed directly for widget creation
             q_col, k_col = st.columns([1, 1])
             with q_col:
-                # Update the underlying state based on widget interaction
-                st.session_state.minor_losses_state[comp]['quantity'] = st.number_input(
+                # Just create the widget, don't assign the return value
+                st.number_input(
                     f"Quantity for {comp}",
                     min_value=1,
-                    # value=entry['quantity'], # REMOVED
                     step=1,
                     key=comp_qty_key
                 )
             with k_col:
-                 # Update the underlying state based on widget interaction
-                st.session_state.minor_losses_state[comp]['k_value'] = st.number_input(
+                # Just create the widget, don't assign the return value
+                st.number_input(
                     f"K Value for {comp}",
                     min_value=0.0,
                     format="%.3f",
-                    # value=entry['k_value'], # REMOVED
                     key=comp_k_key
                 )
+            
+            # Update the state dictionary from the widget keys after creation
+            st.session_state.minor_losses_state[comp]['quantity'] = st.session_state[comp_qty_key]
+            st.session_state.minor_losses_state[comp]['k_value'] = st.session_state[comp_k_key]
 
         # Build DataFrame for storage and later use
         minor_list = []
