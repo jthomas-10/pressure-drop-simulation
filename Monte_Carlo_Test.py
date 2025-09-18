@@ -2063,7 +2063,7 @@ elif st.session_state.active_tab == "results":
                 'Elevation Change (m)': elevation_samples,
                 'Reynolds Number (avg)': Re_samples,  # Mark as average
                 'Friction Factor (avg)': f_samples,   # Mark as average
-                'Velocity (avg)': v_samples           # Mark as average
+                'Velocity (avg) (m/s)': v_samples     # Mark as average with units
             })
         else:
             # For single pipes, include actual diameter/length
@@ -2171,7 +2171,7 @@ elif st.session_state.active_tab == "results":
             cols_order = ['Pressure Drop', 'Pipe Config', f'Diameters ({units_selected_run})', 
                          f'Total Length ({units_selected_run})', 'Mass Flow Rate (kg/s)', 
                          'Elevation Change (m)', 'Reynolds Number (avg)', 'Friction Factor (avg)', 
-                         'Velocity (avg)']
+                         'Velocity (avg) (m/s)']
             # Only include columns that exist
             cols_order = [col for col in cols_order if col in sample_data_display.columns]
             sample_data_display = sample_data_display[cols_order]
@@ -2217,7 +2217,7 @@ elif st.session_state.active_tab == "results":
                 # Reorder columns for clarity
                 cols_order = ['Pressure Drop', 'Total Sections', 'Diameters', 'Total Length', 
                              'Mass Flow Rate (kg/s)', 'Elevation Change (m)',
-                             'Reynolds Number (avg)', 'Friction Factor (avg)', 'Velocity (avg)']
+                             'Reynolds Number (avg)', 'Friction Factor (avg)', 'Velocity (avg) (m/s)']
                 export_data = export_data[cols_order]
                 export_data.to_excel(writer, sheet_name='Full Results', index=False)
             else:
