@@ -1146,26 +1146,44 @@ def render_minor_losses_section():
             
             # Display with actions
             for idx, row in display_df.iterrows():
-                col1, col2, col3, col4, col5, col6 = st.columns([3, 1, 1, 1.5, 1, 1] if use_multiple_sections else [3, 1, 1, 0, 1, 1])
-                
-                with col1:
-                    st.text(row['component_type'])
-                with col2:
-                    st.text(f"{row['quantity']}")
-                with col3:
-                    st.text(f"{row['k_value']:.3f}")
                 if use_multiple_sections:
+                    col1, col2, col3, col4, col5, col6 = st.columns([3, 1, 1, 1.5, 1, 1])
+                    
+                    with col1:
+                        st.text(row['component_type'])
+                    with col2:
+                        st.text(f"{row['quantity']}")
+                    with col3:
+                        st.text(f"{row['k_value']:.3f}")
                     with col4:
                         st.text(row.get('location', 'All Sections'))
-                with col5:
-                    st.text(f"{row['total_k']:.3f}")
-                with col6:
-                    if st.button("🗑️", key=f"delete_{idx}", help="Delete this component"):
-                        st.session_state.minor_losses_list = [
-                            item for item in st.session_state.minor_losses_list 
-                            if item['id'] != row['id']
-                        ]
-                        st.rerun()
+                    with col5:
+                        st.text(f"{row['total_k']:.3f}")
+                    with col6:
+                        if st.button("🗑️", key=f"delete_{idx}", help="Delete this component"):
+                            st.session_state.minor_losses_list = [
+                                item for item in st.session_state.minor_losses_list 
+                                if item['id'] != row['id']
+                            ]
+                            st.rerun()
+                else:
+                    col1, col2, col3, col5, col6 = st.columns([3, 1, 1, 1, 1])
+                    
+                    with col1:
+                        st.text(row['component_type'])
+                    with col2:
+                        st.text(f"{row['quantity']}")
+                    with col3:
+                        st.text(f"{row['k_value']:.3f}")
+                    with col5:
+                        st.text(f"{row['total_k']:.3f}")
+                    with col6:
+                        if st.button("🗑️", key=f"delete_{idx}", help="Delete this component"):
+                            st.session_state.minor_losses_list = [
+                                item for item in st.session_state.minor_losses_list 
+                                if item['id'] != row['id']
+                            ]
+                            st.rerun()
             
             # Summary statistics
             st.markdown("---")
