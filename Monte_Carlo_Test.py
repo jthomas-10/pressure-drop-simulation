@@ -708,35 +708,53 @@ def render_fluid_section():
                 st.session_state.pressure_kPa = 101.325  # 1 atm
             if 'back_pressure_kPa' not in st.session_state:
                 st.session_state.back_pressure_kPa = 101.325  # 1 atm default
+            
+            # Store previous unit to detect changes
+            if 'prev_pressure_unit' not in st.session_state:
+                st.session_state.prev_pressure_unit = st.session_state.pressure_unit
+            
             pressure_unit = st.selectbox("Pressure Unit", ['kPa', 'psia'], key='pressure_unit')
             
-            # Upstream pressure input
-            display_pressure = st.session_state.pressure_kPa if pressure_unit == 'kPa' else st.session_state.pressure_kPa / 6.894757
+            # Check if unit has changed and convert stored values
+            if pressure_unit != st.session_state.prev_pressure_unit:
+                # Unit has changed, no need to convert stored kPa values as they're always in kPa
+                st.session_state.prev_pressure_unit = pressure_unit
+            
+            # Upstream pressure input - always display converted from internal kPa storage
+            if pressure_unit == 'kPa':
+                display_pressure = st.session_state.pressure_kPa
+            else:  # psia
+                display_pressure = st.session_state.pressure_kPa / 6.894757
+            
             pressure_input = st.number_input(
                 f"Upstream Pressure ({pressure_unit})",
                 min_value=0.1,
                 step=1.0,
                 format="%.4g",
                 value=display_pressure,
-                key='pressure_input',
+                key='pressure_input_widget',  # Changed key to avoid conflicts
                 help="Inlet pressure at the beginning of the pipe system"
             )
-            # Convert back to kPa for internal use
+            # Convert input back to kPa for internal storage
             st.session_state.pressure_kPa = pressure_input if pressure_unit == 'kPa' else pressure_input * 6.894757
             pressure_kPa = st.session_state.pressure_kPa
             
-            # Back pressure input
-            display_back_pressure = st.session_state.back_pressure_kPa if pressure_unit == 'kPa' else st.session_state.back_pressure_kPa / 6.894757
+            # Back pressure input - always display converted from internal kPa storage
+            if pressure_unit == 'kPa':
+                display_back_pressure = st.session_state.back_pressure_kPa
+            else:  # psia
+                display_back_pressure = st.session_state.back_pressure_kPa / 6.894757
+            
             back_pressure_input = st.number_input(
                 f"Downstream/Back Pressure ({pressure_unit})",
                 min_value=0.1,
                 step=1.0,
                 format="%.4g",
                 value=display_back_pressure,
-                key='back_pressure_input',
+                key='back_pressure_input_widget',  # Changed key to avoid conflicts
                 help="Outlet pressure at the end of the pipe system"
             )
-            # Convert back to kPa for internal use
+            # Convert input back to kPa for internal storage
             st.session_state.back_pressure_kPa = back_pressure_input if pressure_unit == 'kPa' else back_pressure_input * 6.894757
             back_pressure_kPa = st.session_state.back_pressure_kPa
             
@@ -794,6 +812,13 @@ def render_fluid_section():
             )
         else:
             property_mode = "CoolProp Only (Default)"
+        
+        # Update session state with CoolProp values when they change
+        # This ensures the distribution inputs always reflect current CoolProp values
+        if 'rho_mean' not in st.session_state or abs(st.session_state.rho_mean - calc_density) > 0.01:
+            st.session_state.rho_mean = calc_density
+        if 'mu_mean' not in st.session_state or abs(st.session_state.mu_mean - calc_viscosity_mPas) > 0.01:
+            st.session_state.mu_mean = calc_viscosity_mPas
         
         # Calculate default std dev based on CoolProp mean
         default_rho_std = calc_density * 0.05
@@ -1061,17 +1086,22 @@ def render_minor_losses_section():
         
         with add_cols[2]:
             # K value - auto-fill for standard components
+            # Use a unique key that includes the component type to force update
             if comp_type != 'Select...' and comp_type != 'Custom':
                 default_k = COMMON_K_VALUES.get(comp_type, 0.0)
+                # Store in session state if component changed
+                if f"k_value_for_{comp_type}" not in st.session_state:
+                    st.session_state[f"k_value_for_{comp_type}"] = default_k
             else:
                 default_k = 0.0
             
+            # Create K value input with proper default
             k_value = st.number_input(
                 "K Value",
                 min_value=0.0,
                 value=default_k,
                 format="%.3f",
-                key="new_comp_k",
+                key=f"new_comp_k_{comp_type}",  # Dynamic key based on component type
                 help="Loss coefficient (auto-filled for standard components)"
             )
         
@@ -1908,15 +1938,16 @@ elif st.session_state.active_tab == "results":
             # Calculate friction factor
             f_samples = calculate_friction_factor(Re_samples, epsilon_samples, D_samples, friction_model)
             
-            # Calculate pressure drop
-            head_loss_pipe = f_samples * (L_samples/D_samples) * (v_samples**2) / (2.0*gravity)
-            deltaP_pipe = rho_samples * gravity * head_loss_pipe
+            # Calculate pressure drop using Darcy-Weisbach equation directly
+            # ΔP = 0.5 * ρ * f * (L/D) * v²
+            deltaP_pipe = 0.5 * rho_samples * f_samples * (L_samples/D_samples) * (v_samples**2)
+            head_loss_pipe = deltaP_pipe / (rho_samples * gravity)  # Convert to head loss for compatibility
         
         # Minor losses and elevation - only compute for single-pipe runs
         progress_bar.progress(70); status_text.text("Finalizing pressure drop calculations...")
         
         if not (use_multiple_sections and pipe_sections):
-            # Single-pipe path: compute and apply minor + elevation here
+            # Single-pipe path: compute and apply minor + elevation
             total_K = 0
             if not minor_losses_data.empty:
                 minor_losses_df = pd.DataFrame(minor_losses_data)
@@ -1924,10 +1955,18 @@ elif st.session_state.active_tab == "results":
                 minor_losses_df['k_value'] = pd.to_numeric(minor_losses_df['k_value'], errors='coerce').fillna(0)
                 total_K = (minor_losses_df['quantity'] * minor_losses_df['k_value']).sum()
             
-            head_loss_minor = total_K * (v_samples**2) / (2.0*gravity)
+            # Calculate minor losses pressure drop directly: ΔP = 0.5 * ρ * K * v²
+            deltaP_minor = 0.5 * rho_samples * total_K * (v_samples**2)
+            
+            # Calculate elevation pressure drop: ΔP = ρ * g * Δz
+            deltaP_elevation = rho_samples * gravity * elevation_samples
+            
+            # Total pressure drop
+            deltaP_samples = deltaP_pipe + deltaP_minor + deltaP_elevation
+            
+            # Keep these for compatibility with display code
+            head_loss_minor = deltaP_minor / (rho_samples * gravity)
             head_loss_elevation = elevation_samples
-            head_loss_total = head_loss_pipe + head_loss_minor + head_loss_elevation
-            deltaP_samples = rho_samples * gravity * head_loss_total
         else:
             # Multi-section path: already fully handled inside the sequential solver
             total_K = 0
@@ -2209,103 +2248,208 @@ elif st.session_state.active_tab == "results":
         # Export to Excel section
         st.subheader("📥 Export Results")
         
-        # Prepare Excel file with multiple sheets
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            # Sheet 1: Summary Statistics
-            summary_export = pd.DataFrame({
-                'Metric': ['Mean', 'Median', 'Std Dev', 'Min', 'Max', 
-                          f'{confidence_level}% CI Lower', f'{confidence_level}% CI Upper'],
-                f'Pressure Drop ({pressure_unit})': [
-                    mean_deltaP, median_deltaP, std_deltaP,
-                    np.min(deltaP_samples), np.max(deltaP_samples),
-                    ci_lower, ci_upper
-                ]
-            })
-            summary_export.to_excel(writer, sheet_name='Summary', index=False)
+        # Import required modules for Excel image embedding
+        from openpyxl.drawing.image import Image as XLImage
+        import tempfile
+        import os
+        
+        # Create temporary files for charts BEFORE the ExcelWriter context
+        tmp_hist_path = None
+        tmp_cdf_path = None
+        
+        try:
+            # Save histogram to temp file
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_hist:
+                hist_fig.savefig(tmp_hist.name, dpi=100, bbox_inches='tight')
+                tmp_hist_path = tmp_hist.name
             
-            # Sheet 2: Full simulation data with configuration info for multi-section
-            if use_multiple_sections and pipe_sections:
-                # Create a modified DataFrame for export that includes configuration details
-                export_data = data.copy()
-                # Add configuration details columns
-                export_data['Total Sections'] = len(pipe_sections)
-                export_data['Diameters'] = diameter_str + f" {units_selected_run}"
-                export_data['Total Length'] = f"{total_length_m:.3f} m"
-                # Reorder columns for clarity
-                cols_order = ['Pressure Drop', 'Total Sections', 'Diameters', 'Total Length', 
-                             'Mass Flow Rate (kg/s)', 'Elevation Change (m)',
-                             'Reynolds Number (avg)', 'Friction Factor (avg)', 'Velocity (avg) (m/s)']
-                export_data = export_data[cols_order]
-                export_data.to_excel(writer, sheet_name='Full Results', index=False)
-            else:
-                # Single pipe - export as is
-                data.to_excel(writer, sheet_name='Full Results', index=False)
+            # Save CDF to temp file
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_cdf:
+                cdf_fig.savefig(tmp_cdf.name, dpi=100, bbox_inches='tight')
+                tmp_cdf_path = tmp_cdf.name
             
-            # Sheet 3: Input parameters
-            # Calculate display pressures based on the unit
-            pressure_unit_export = inputs["pressure_unit"]
-            if pressure_unit_export == 'kPa':
-                display_pressure_export = inputs['pressure_kPa']
-                display_back_pressure_export = inputs['back_pressure_kPa']
-            else:  # psia
-                display_pressure_export = inputs['pressure_kPa'] / 6.894757
-                display_back_pressure_export = inputs['back_pressure_kPa'] / 6.894757
-            
-            input_params = pd.DataFrame({
-                'Parameter': [
-                    'Fluid', 'Temperature (K)', f'Upstream Pressure ({pressure_unit_export})',
-                    f'Back Pressure ({pressure_unit_export})', 'Number of Simulations',
-                    'Confidence Level (%)', 'Friction Model', 'Gravity (m/s²)'
-                ],
-                'Value': [
-                    selected_fluid, inputs['temperature_K'],
-                    display_pressure_export,
-                    display_back_pressure_export,
-                    num_simulations, confidence_level, friction_model, gravity
-                ]
-            })
-            input_params.to_excel(writer, sheet_name='Input Parameters', index=False)
-            
-            # Sheet 4: Pipe configuration
-            if use_multiple_sections and pipe_sections:
-                pipe_config_df = pd.DataFrame(pipe_sections)
-                pipe_config_df.to_excel(writer, sheet_name='Pipe Configuration', index=False)
-            else:
-                pipe_config_single = pd.DataFrame({
-                    'Parameter': ['Diameter', 'Length', 'Roughness', 'Units'],
+            # Prepare Excel file with multiple sheets
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                # Sheet 1: Enhanced Summary Statistics with Charts
+                # Add percentile values
+                percentiles = [5, 10, 25, 50, 75, 90, 95]
+                percentile_values = [np.percentile(deltaP_samples, p) for p in percentiles]
+                
+                summary_export = pd.DataFrame({
+                    'Metric': ['Mean', 'Median', 'Std Dev', 'Min', 'Max', 
+                              f'{confidence_level}% CI Lower', f'{confidence_level}% CI Upper'] + 
+                              [f'P{p} (Percentile {p}%)' for p in percentiles],
+                    f'Pressure Drop ({pressure_unit})': [
+                        mean_deltaP, median_deltaP, std_deltaP,
+                        np.min(deltaP_samples), np.max(deltaP_samples),
+                        ci_lower, ci_upper
+                    ] + percentile_values
+                })
+                summary_export.to_excel(writer, sheet_name='Summary', index=False)
+                
+                # Embed charts in Excel if temp files were created successfully
+                if tmp_hist_path and tmp_cdf_path and os.path.exists(tmp_hist_path) and os.path.exists(tmp_cdf_path):
+                    try:
+                        workbook = writer.book
+                        worksheet = writer.sheets['Summary']
+                        
+                        # Add histogram image to Excel
+                        img_hist = XLImage(tmp_hist_path)
+                        img_hist.width = 480  # Adjust size as needed
+                        img_hist.height = 360
+                        worksheet.add_image(img_hist, 'D2')  # Position next to the summary table
+                        
+                        # Add CDF image to Excel
+                        img_cdf = XLImage(tmp_cdf_path)
+                        img_cdf.width = 480
+                        img_cdf.height = 360
+                        worksheet.add_image(img_cdf, 'D25')  # Position below histogram
+                    except Exception as e:
+                        st.warning(f"Could not embed charts in Excel: {e}")
+                
+                # Sheet 2: Full simulation data with configuration info for multi-section
+                if use_multiple_sections and pipe_sections:
+                    # Create a modified DataFrame for export that includes configuration details
+                    export_data = data.copy()
+                    # Add configuration details columns
+                    export_data['Total Sections'] = len(pipe_sections)
+                    export_data['Diameters'] = diameter_str + f" {units_selected_run}"
+                    export_data['Total Length'] = f"{total_length_m:.3f} m"
+                    # Reorder columns for clarity
+                    cols_order = ['Pressure Drop', 'Total Sections', 'Diameters', 'Total Length', 
+                                 'Mass Flow Rate (kg/s)', 'Elevation Change (m)',
+                                 'Reynolds Number (avg)', 'Friction Factor (avg)', 'Velocity (avg) (m/s)']
+                    export_data = export_data[cols_order]
+                    export_data.to_excel(writer, sheet_name='Full Results', index=False)
+                else:
+                    # Single pipe - export as is
+                    data.to_excel(writer, sheet_name='Full Results', index=False)
+                
+                # Sheet 3: Input parameters
+                # Calculate display pressures based on the unit
+                pressure_unit_export = inputs["pressure_unit"]
+                if pressure_unit_export == 'kPa':
+                    display_pressure_export = inputs['pressure_kPa']
+                    display_back_pressure_export = inputs['back_pressure_kPa']
+                else:  # psia
+                    display_pressure_export = inputs['pressure_kPa'] / 6.894757
+                    display_back_pressure_export = inputs['back_pressure_kPa'] / 6.894757
+                
+                input_params = pd.DataFrame({
+                    'Parameter': [
+                        'Fluid', 'Temperature (K)', f'Upstream Pressure ({pressure_unit_export})',
+                        f'Back Pressure ({pressure_unit_export})', 'Number of Simulations',
+                        'Confidence Level (%)', 'Friction Model', 'Gravity (m/s²)'
+                    ],
                     'Value': [
-                        inputs.get('D_mean', 'N/A'),
-                        inputs.get('L_mean', 'N/A'),
-                        inputs.get('epsilon_mean', 'N/A'),
-                        units_selected_run
+                        selected_fluid, inputs['temperature_K'],
+                        display_pressure_export,
+                        display_back_pressure_export,
+                        num_simulations, confidence_level, friction_model, gravity
                     ]
                 })
-                pipe_config_single.to_excel(writer, sheet_name='Pipe Configuration', index=False)
+                input_params.to_excel(writer, sheet_name='Input Parameters', index=False)
+                
+                # Sheet 4: Pipe configuration
+                if use_multiple_sections and pipe_sections:
+                    pipe_config_df = pd.DataFrame(pipe_sections)
+                    pipe_config_df.to_excel(writer, sheet_name='Pipe Configuration', index=False)
+                else:
+                    pipe_config_single = pd.DataFrame({
+                        'Parameter': ['Diameter', 'Length', 'Roughness', 'Units'],
+                        'Value': [
+                            inputs.get('D_mean', 'N/A'),
+                            inputs.get('L_mean', 'N/A'),
+                            inputs.get('epsilon_mean', 'N/A'),
+                            units_selected_run
+                        ]
+                    })
+                    pipe_config_single.to_excel(writer, sheet_name='Pipe Configuration', index=False)
+                
+                # Sheet 5: Minor Losses (always create this sheet)
+                if not minor_losses_data.empty:
+                    # Write the minor losses data
+                    minor_losses_data.to_excel(writer, sheet_name='Minor Losses', index=False, startrow=0)
+                    
+                    # Calculate totals
+                    minor_losses_df = pd.DataFrame(minor_losses_data)
+                    minor_losses_df['quantity'] = pd.to_numeric(minor_losses_df['quantity'], errors='coerce').fillna(0)
+                    minor_losses_df['k_value'] = pd.to_numeric(minor_losses_df['k_value'], errors='coerce').fillna(0)
+                    minor_losses_df['total_k'] = minor_losses_df['quantity'] * minor_losses_df['k_value']
+                    
+                    # Add summary row
+                    total_k = minor_losses_df['total_k'].sum()
+                    total_components = len(minor_losses_df)
+                    
+                    # Add blank row and then totals
+                    start_row = len(minor_losses_df) + 2
+                    
+                    # Add summary section
+                    summary_data = pd.DataFrame({
+                        'Summary': ['Total K Value', 'Total Components', 'Mean Velocity (m/s)', 'Minor Loss Pressure Drop (Pa)'],
+                        'Value': [
+                            f'{total_k:.3f}',
+                            str(total_components),
+                            f'{np.mean(v_samples):.2f}' if 'v_samples' in locals() else 'N/A',
+                            f'{np.mean(0.5 * rho_samples * total_k * (v_samples**2)):.2f}' if 'v_samples' in locals() and total_k > 0 else '0.00'
+                        ]
+                    })
+                    
+                    # Write summary to Excel
+                    summary_data.to_excel(writer, sheet_name='Minor Losses', index=False, startrow=start_row)
+                    
+                    # Add formatting note
+                    note_row = start_row + len(summary_data) + 2
+                    note_df = pd.DataFrame({
+                        'Note': ['K values represent loss coefficients for incompressible flow.',
+                                'Pressure drop = 0.5 * ρ * K * v²']
+                    })
+                    note_df.to_excel(writer, sheet_name='Minor Losses', index=False, startrow=note_row, header=False)
+                else:
+                    # Create empty Minor Losses sheet with message
+                    empty_df = pd.DataFrame({
+                        'Component Type': ['No minor losses defined'],
+                        'Quantity': ['-'],
+                        'K Value': ['-'],
+                        'Location': ['-'] if use_multiple_sections else ['-']
+                    })
+                    if not use_multiple_sections:
+                        empty_df = empty_df.drop(columns=['Location'])
+                    empty_df.to_excel(writer, sheet_name='Minor Losses', index=False)
+                
+                # Sheet 6: Correlation analysis
+                correlation_export = pd.DataFrame(pressure_drop_corr).reset_index()
+                correlation_export.columns = ['Parameter', 'Correlation with Pressure Drop']
+                correlation_export.to_excel(writer, sheet_name='Correlations', index=False)
             
-            # Sheet 5: Minor losses
-            if not minor_losses_data.empty:
-                minor_losses_data.to_excel(writer, sheet_name='Minor Losses', index=False)
+            # Create download button
+            excel_data = output.getvalue()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"pressure_drop_simulation_{timestamp}.xlsx"
             
-            # Sheet 6: Correlation analysis
-            correlation_export = pd.DataFrame(pressure_drop_corr).reset_index()
-            correlation_export.columns = ['Parameter', 'Correlation with Pressure Drop']
-            correlation_export.to_excel(writer, sheet_name='Correlations', index=False)
-        
-        # Create download button
-        excel_data = output.getvalue()
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"pressure_drop_simulation_{timestamp}.xlsx"
-        
-        st.download_button(
-            label="📥 Download Excel Report",
-            data=excel_data,
-            file_name=filename,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            help="Download complete simulation results as Excel file with multiple sheets"
-        )
-        
-        st.success(f"✅ Excel file ready for download: {filename}")
+            st.download_button(
+                label="📥 Download Excel Report",
+                data=excel_data,
+                file_name=filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                help="Download complete simulation results as Excel file with multiple sheets"
+            )
+            
+            st.success(f"✅ Excel file ready for download: {filename}")
+            
+        finally:
+            # Clean up temporary files after Excel is saved
+            if tmp_hist_path and os.path.exists(tmp_hist_path):
+                try:
+                    os.unlink(tmp_hist_path)
+                except:
+                    pass
+            if tmp_cdf_path and os.path.exists(tmp_cdf_path):
+                try:
+                    os.unlink(tmp_cdf_path)
+                except:
+                    pass
 # --------------------------------------------------------------------------------
 # FOOTER
 # --------------------------------------------------------------------------------
